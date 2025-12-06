@@ -34,6 +34,7 @@
  */
 
 #include "print_task.h"
+#include "watchdog.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -177,6 +178,13 @@ void print_task_handler(void *parameters)
 {
     char message_buffer[PRINT_MESSAGE_MAX_SIZE];
 
+    // Register with watchdog (5 second timeout = 2.5× the 2s blocking period)
+    watchdog_id_t wd_id = watchdog_register("Print_Task", 5000);
+    if (wd_id == WATCHDOG_INVALID_ID) {
+        // Can't use print_message here (would cause recursion), so silently fail
+        // Watchdog will still monitor other tasks
+    }
+
     while (1) {
         /*
          * Main Print Loop
@@ -192,9 +200,9 @@ void print_task_handler(void *parameters)
          * 5. Return to step 1
          */
 
-        // Block waiting for message (infinite timeout)
-        // Task scheduler will run other tasks while we're blocked
-        if (xQueueReceive(print_queue, message_buffer, portMAX_DELAY) == pdPASS) {
+        // Block waiting for message with finite timeout
+        // Timeout allows periodic watchdog feeding even when no print activity
+        if (xQueueReceive(print_queue, message_buffer, pdMS_TO_TICKS(2000)) == pdPASS) {
             // Message received - transmit it
             // HAL_MAX_DELAY: Wait indefinitely for UART to be ready
             // This is safe because we're the only task using UART TX
@@ -202,21 +210,17 @@ void print_task_handler(void *parameters)
                             (uint8_t *)message_buffer,
                             strlen(message_buffer),
                             HAL_MAX_DELAY);
+        }
 
-            /*
-             * Transmission complete. Loop back to receive next message.
-             *
-             * Note: We don't explicitly yield here because:
-             * 1. xQueueReceive() will block if no messages available
-             * 2. Higher priority tasks can preempt us at any time
-             * 3. FreeRTOS scheduler handles fair scheduling automatically
-             */
+        // Feed watchdog to prove task is alive
+        // Fed on every iteration (whether message received or timeout)
+        if (wd_id != WATCHDOG_INVALID_ID) {
+            watchdog_feed(wd_id);
         }
 
         /*
-         * If xQueueReceive() fails (should never happen with portMAX_DELAY),
-         * just loop back and try again. This provides robustness against
-         * unexpected queue corruption or errors.
+         * Loop continues regardless of receive status.
+         * Watchdog is fed on every iteration to prove task is alive.
          */
     }
 }

@@ -39,6 +39,7 @@
 #include "uart_task.h"
 #include "led_effects.h"
 #include "print_task.h"
+#include "watchdog.h"
 #include <string.h>
 #include <stdio.h>
 #include <ctype.h>
@@ -182,9 +183,22 @@ void command_handler_task(void *parameters)
 {
     char received_command[COMMAND_MAX_LENGTH];
 
+    // Register with watchdog (5 second timeout = 2.5× the 2s blocking period)
+    watchdog_id_t wd_id = watchdog_register("CMD_Handler", 5000);
+    if (wd_id == WATCHDOG_INVALID_ID) {
+        print_message("[CMD] Failed to register with watchdog!\r\n");
+    }
+
     while (1) {
-        // Wait for notification from UART task
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        // Wait for notification from UART task with finite timeout
+        // Timeout allows periodic watchdog feeding even when no commands
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(2000));
+
+        // Feed watchdog to prove task is alive
+        // Fed on every iteration (whether notification received or timeout)
+        if (wd_id != WATCHDOG_INVALID_ID) {
+            watchdog_feed(wd_id);
+        }
 
         // Try to receive command from queue
         while (xQueueReceive(command_queue, received_command, 0) == pdPASS) {

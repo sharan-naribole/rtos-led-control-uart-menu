@@ -6,8 +6,8 @@
 ## System Overview
 
 This project demonstrates a **FreeRTOS architecture** featuring:
-1. **Stream Buffer UART RX** - Efficient interrupt-driven reception with task blocking
-2. **Dedicated Print Task** - Exclusive UART TX ownership
+1. **Stream Buffer UART RX** - Efficient interrupt-driven reception with TRUE task blocking
+2. **Dedicated Print Task** - Exclusive UART TX ownership (no mutex needed)
 3. **Multi-Task Command Processing** - Separation of reception, processing, and output
 4. **Interactive Menu System** - Hierarchical command interface
 
@@ -99,25 +99,33 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 }
 ```
 
-3. **Task reads (TRUE BLOCKING):**
+3. **Task reads (with finite timeout for watchdog):**
 ```c
 void uart_task_handler(void *parameters)
 {
-    while(1) {
-        // Task enters BLOCKED state, yields CPU!
-        xStreamBufferReceive(uart_stream_buffer, &ch, 1, portMAX_DELAY);
+    watchdog_id_t wd_id = watchdog_register("UART_task", 5000);
 
-        // Wakes here when ISR deposits byte
-        process_character(ch);
+    while(1) {
+        // Task enters BLOCKED state (yields CPU) for up to 2 seconds
+        xStreamBufferReceive(uart_stream_buffer, &ch, 1, pdMS_TO_TICKS(2000));
+
+        // Feed watchdog every iteration (timeout or data received)
+        watchdog_feed(wd_id);
+
+        // Wakes here when ISR deposits byte OR on 2s timeout
+        if (received > 0) {
+            process_character(ch);
+        }
     }
 }
 ```
 
 **Benefits:**
 - ✅ **TRUE blocking** - Task enters BLOCKED state, yields CPU to other tasks
-- ✅ **Zero CPU waste** - No polling loop
+- ✅ **Zero CPU waste** - No polling loop (wakes on data OR 2s timeout)
 - ✅ **Instant wake-up** - ISR immediately unblocks task (<10μs latency)
 - ✅ **Thread-safe** - Lock-free ISR-to-Task communication
+- ✅ **Watchdog monitored** - Detects deadlocks/hangs automatically
 - ✅ **Production-quality** - Proper RTOS design pattern
 
 ---
@@ -239,15 +247,22 @@ print_char('A');                    // ~20-50μs, no blocking
 
 ## Task Priority & Scheduling
 
-| Task | Priority | Stack | Function | Blocking Point |
-|------|----------|-------|----------|----------------|
-| **Print Task** | 3 (highest) | 512 words | UART TX | `xQueueReceive` on print_queue |
-| **UART Task** | 2 | 1024 words | UART RX via stream buffer | `xStreamBufferReceive` |
-| **Command Handler** | 2 | 1024 words | Command processing | `ulTaskNotifyTake` |
-| **Timer Service** | 2 | 512 words | LED timer callbacks | Event-driven |
-| **Idle Task** | 0 (lowest) | Auto | Power save (WFI) | Runs when all blocked |
+| Task | Priority | Stack | Function | Blocking Point | Watchdog |
+|------|----------|-------|----------|----------------|----------|
+| **Watchdog Task** | 4 (highest) | 256 words | Deadlock detection | `vTaskDelayUntil` (1s period) | N/A (monitor) |
+| **Print Task** | 3 | 512 words | UART TX | `xQueueReceive` (2s timeout) | ✅ 5s timeout |
+| **UART Task** | 2 | 1024 words | UART RX via stream buffer | `xStreamBufferReceive` (2s timeout) | ✅ 5s timeout |
+| **Command Handler** | 2 | 1024 words | Command processing | `ulTaskNotifyTake` (2s timeout) | ✅ 5s timeout |
+| **Timer Service** | 2 | 512 words | LED timer callbacks | Event-driven | ❌ Not registered |
+| **Idle Task** | 0 (lowest) | Auto | Power save (WFI) | Runs when all blocked | ❌ Not registered |
 
-**Why Print Task has highest priority:**
+**Why Watchdog has highest priority:**
+- Must run even if other tasks are hung
+- Critical for system reliability
+- Very short execution time (~1ms per check)
+- Runs only every 1 second
+
+**Why Print Task has 2nd highest priority:**
 - Ensures responsive user feedback
 - Prevents print queue overflow
 - Short execution time (just UART TX)
@@ -430,6 +445,233 @@ UART Task → Command Queue → Command Handler
 
 ---
 
+## Watchdog System (Deadlock Detection)
+
+### Architecture
+
+**All three application tasks actively monitored:**
+
+```
+┌──────────────┐   Register   ┌──────────────┐
+│  UART_task   │──────────────>│              │
+└──────┬───────┘               │              │
+       │ Feed every 2s         │  Watchdog    │  Checks every 1s
+┌──────▼────────┐              │   Monitor    │  → Alerts on timeout
+│ CMD_Handler   │──────────────>│   Task       │     (5s timeout)
+└──────┬────────┘              │ (Priority 4) │
+       │ Feed every 2s         │              │
+┌──────▼────────┐              │              │
+│  Print_Task   │──────────────>│              │
+└───────────────┘   Register   └──────────────┘
+                                      │
+                               Timeout detected!
+                                      ↓
+                               UART Alert / Callback
+```
+
+**Registered Tasks:**
+- ✅ `UART_task` - Timeout: 5000ms, Feed interval: 2000ms
+- ✅ `CMD_Handler` - Timeout: 5000ms, Feed interval: 2000ms
+- ✅ `Print_Task` - Timeout: 5000ms, Feed interval: 2000ms
+
+---
+
+### How It Works
+
+**1. Registration (at task startup):**
+```c
+void uart_task_handler(void *parameters)
+{
+    // Register with 5 second timeout (2.5× the 2s blocking period)
+    watchdog_id_t wd_id = watchdog_register("UART_task", 5000);
+
+    // Task loop...
+}
+```
+
+**2. Finite Timeout Pattern (for watchdog compatibility):**
+```c
+while(1) {
+    // Use finite timeout instead of portMAX_DELAY
+    // Allows periodic watchdog feeding even when idle
+    xStreamBufferReceive(buffer, &ch, 1, pdMS_TO_TICKS(2000));
+
+    // Feed watchdog on every iteration (whether data received or timeout)
+    watchdog_feed(wd_id);
+}
+```
+
+**3. Monitoring (watchdog task runs every 1 second):**
+```c
+void watchdog_task(void)
+{
+    while(1) {
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(1000));
+
+        for (each registered task) {
+            if (time_since_last_feed > timeout) {
+                // ALERT! Task is hung or deadlocked
+                print_alert(task_name, time_since_last_feed);
+            }
+        }
+    }
+}
+```
+
+---
+
+### What Watchdog Detects
+
+| Problem | Detection | Example |
+|---------|-----------|---------|
+| **Infinite Loop** | ✅ Yes | Task stuck in `while(1) {}` without feeding |
+| **Deadlock** | ✅ Yes | Task waiting on mutex forever |
+| **Priority Inversion** | ✅ Yes | High priority task starved of CPU |
+| **Hard Fault** | ✅ Yes | Task crashed before feeding |
+| **Slow Task** | ⚠️ Maybe | If timeout too short → false alarm |
+| **Logical Error** | ❌ No | Task runs but does wrong thing |
+
+---
+
+### Configuration
+
+In `watchdog.h`:
+```c
+#define WATCHDOG_MAX_TASKS  8         // Max tasks to monitor
+#define WATCHDOG_TASK_PRIORITY  4     // Highest priority
+#define WATCHDOG_TASK_STACK_SIZE  256 // Stack (words)
+#define WATCHDOG_CHECK_PERIOD_MS  1000 // Check interval
+```
+
+---
+
+### Actual Implementation
+
+**UART Task:**
+```c
+void uart_task_handler(void *parameters)
+{
+    // Register with 5 second timeout
+    watchdog_id_t wd_id = watchdog_register("UART_task", 5000);
+
+    while (1) {
+        // Finite 2s timeout (not portMAX_DELAY)
+        xStreamBufferReceive(buffer, &ch, 1, pdMS_TO_TICKS(2000));
+
+        // Feed watchdog every iteration
+        watchdog_feed(wd_id);
+
+        if (received > 0) {
+            handle_character(ch);
+        }
+    }
+}
+```
+
+**Command Handler Task:**
+```c
+void command_handler_task(void *parameters)
+{
+    // Register with 5 second timeout
+    watchdog_id_t wd_id = watchdog_register("CMD_Handler", 5000);
+
+    while (1) {
+        // Finite 2s timeout (not portMAX_DELAY)
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(2000));
+
+        // Feed watchdog every iteration
+        watchdog_feed(wd_id);
+
+        while (xQueueReceive(command_queue, cmd, 0) == pdPASS) {
+            process_command(cmd);
+        }
+    }
+}
+```
+
+**Print Task:**
+```c
+void print_task_handler(void *parameters)
+{
+    // Register with 5 second timeout
+    watchdog_id_t wd_id = watchdog_register("Print_Task", 5000);
+
+    while (1) {
+        // Finite 2s timeout (not portMAX_DELAY)
+        xQueueReceive(print_queue, msg, pdMS_TO_TICKS(2000));
+
+        // Feed watchdog every iteration
+        watchdog_feed(wd_id);
+
+        if (received) {
+            HAL_UART_Transmit(&huart2, msg, len, HAL_MAX_DELAY);
+        }
+    }
+}
+```
+
+**When timeout occurs:**
+```
+*** WATCHDOG ALERT ***
+Task: UART_task (ID=0)
+Last feed: 5234 ms ago
+Timeout: 5000 ms
+Status: HUNG or DEADLOCKED!
+```
+
+---
+
+### Best Practices
+
+**DO:**
+- ✅ Use finite blocking timeouts (e.g., 2 seconds) instead of `portMAX_DELAY`
+- ✅ Feed watchdog on every loop iteration (whether work done or timeout)
+- ✅ Set watchdog timeout = 2-3× blocking period (5s for 2s loop)
+- ✅ Register task after initialization, before main loop
+- ✅ Test with intentional deadlock to verify detection
+
+**DON'T:**
+- ❌ Use `portMAX_DELAY` if task is registered with watchdog
+- ❌ Feed only when work is done (feed on timeout too!)
+- ❌ Use timeout shorter than normal execution time
+- ❌ Feed blindly without checking watchdog registration succeeded
+- ❌ Forget to test!
+
+**Key Pattern:**
+```c
+// GOOD: Finite timeout + feed on every iteration
+while(1) {
+    xQueueReceive(queue, &item, pdMS_TO_TICKS(2000));  // Finite timeout
+    watchdog_feed(wd_id);  // Feed regardless of receive status
+}
+
+// BAD: Infinite blocking prevents watchdog feeding
+while(1) {
+    xQueueReceive(queue, &item, portMAX_DELAY);  // Never times out!
+    watchdog_feed(wd_id);  // Only fed when item received
+}
+```
+
+---
+
+### Memory Overhead
+
+| Component | Size |
+|-----------|------|
+| Watchdog task stack | 256 words (1024 bytes) |
+| Task tracking array (8 tasks) | ~192 bytes |
+| Total | ~1.2 KB |
+
+---
+
+### CPU Overhead
+
+- **Idle:** 0% (task blocked)
+- **Active:** ~0.1% (1ms check every 1 second)
+- **On timeout:** Brief spike for alert message
+
+---
+
 ## Comparison: Before vs After Stream Buffer
 
 ### Before (Polling Mode)
@@ -478,12 +720,20 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 
 void uart_task_handler(void *parameters)
 {
-    while(1) {
-        // TRUE BLOCKING - task enters BLOCKED state, yields CPU
-        xStreamBufferReceive(uart_stream_buffer, &ch, 1, portMAX_DELAY);
+    // Register with watchdog
+    watchdog_id_t wd_id = watchdog_register("UART_task", 5000);
 
-        print_char(ch);
-        // ...
+    while(1) {
+        // Finite timeout (not portMAX_DELAY) for watchdog compatibility
+        xStreamBufferReceive(uart_stream_buffer, &ch, 1, pdMS_TO_TICKS(2000));
+
+        // Feed watchdog to prove task is alive
+        watchdog_feed(wd_id);
+
+        if (received > 0) {
+            print_char(ch);
+            // ...
+        }
     }
 }
 ```
@@ -766,6 +1016,8 @@ void print_system_stats(void)
 | **UART TX** | Dedicated Print Task | No mutex, no priority inversion |
 | **Command Flow** | Queue-based | Decoupled RX from processing |
 | **LED Control** | Software Timers | Non-blocking, deterministic |
+| **Watchdog** | All 3 tasks monitored (2s feed, 5s timeout) | Deadlock/hang detection |
+| **Task Blocking** | Finite timeouts (2s) | Watchdog compatible |
 | **Power** | WFI in idle hook | ~98% time in low-power mode |
 | **Thread Safety** | Queues + Stream Buffers | Lock-free, no race conditions |
 

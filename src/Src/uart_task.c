@@ -42,6 +42,7 @@
 #include "uart_task.h"
 #include "command_handler.h"
 #include "print_task.h"
+#include "watchdog.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -234,6 +235,12 @@ void uart_task_handler(void *parameters)
     print_welcome_message();
     print_main_menu();
 
+    // Register with watchdog (5 second timeout = 2.5× the 2s blocking period)
+    watchdog_id_t wd_id = watchdog_register("UART_task", 5000);
+    if (wd_id == WATCHDOG_INVALID_ID) {
+        print_message("[UART] Failed to register with watchdog!\r\n");
+    }
+
     while (1) {
         /*
          * Main Reception Loop
@@ -251,13 +258,19 @@ void uart_task_handler(void *parameters)
          *    - Normal: Add to buffer (with overflow check)
          */
 
-        // Read one byte from stream buffer
-        // TRUE BLOCKING: Task enters BLOCKED state, yields CPU to other tasks
-        // Wakes immediately when ISR deposits byte into stream buffer
+        // Read one byte from stream buffer with finite timeout
+        // Timeout allows periodic watchdog feeding even when no UART activity
+        // 2 second timeout provides good balance between responsiveness and watchdog checking
         size_t received = xStreamBufferReceive(uart_stream_buffer,
                                                &received_char,
                                                1,
-                                               portMAX_DELAY);
+                                               pdMS_TO_TICKS(2000));
+
+        // Feed watchdog to prove task is alive
+        // Fed on every iteration (whether data received or timeout)
+        if (wd_id != WATCHDOG_INVALID_ID) {
+            watchdog_feed(wd_id);
+        }
 
         if (received > 0) {
             /*

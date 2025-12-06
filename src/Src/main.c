@@ -46,6 +46,7 @@
 #include "uart_task.h"
 #include "command_handler.h"
 #include "print_task.h"
+#include "watchdog.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -139,7 +140,11 @@ int main(void)
 	status = xTaskCreate(uart_task_handler, "UART_task", 512, NULL, 2, NULL);
 	configASSERT(status == pdPASS);
 
-	// Step 5: Start the FreeRTOS scheduler
+	// Step 5: Initialize watchdog monitor
+	// Creates watchdog task (priority 4) to detect hung/deadlocked tasks
+	watchdog_init();
+
+	// Step 6: Start the FreeRTOS scheduler
 	// After this point, tasks begin executing and main() never returns
 	vTaskStartScheduler();
 

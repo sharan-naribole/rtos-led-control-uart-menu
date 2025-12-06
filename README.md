@@ -17,6 +17,7 @@ This project showcases a **production-ready FreeRTOS application** with an inter
 - 🔒 **Thread-Safe Design**: Queue-based architecture eliminates race conditions
 - ⚡ **Non-Blocking I/O**: Print operations return immediately, no task blocking
 - ⚙️ **Efficient UART RX**: Stream Buffer mode with TRUE task blocking (zero CPU waste)
+- 🐕 **Watchdog System**: Detects hung or deadlocked tasks automatically
 - 🔋 **Power Efficient**: ~98% CPU idle time, WFI sleep mode in idle hook
 - 📊 **Well Architected**: Clean separation of concerns (RX, TX, commands, LEDs)
 - 📚 **Comprehensive Documentation**: Detailed architecture documentation included
@@ -26,6 +27,7 @@ This project showcases a **production-ready FreeRTOS application** with an inter
 ### Task Structure
 
 ```
+Priority 4: Watchdog Task   → Monitors task health, detects deadlocks
 Priority 3: Print Task      → Exclusive UART TX owner
 Priority 2: UART Task       → Character reception & buffering
 Priority 2: Command Handler → Menu state machine & LED control
@@ -85,6 +87,47 @@ Stream Buffer ──> UART Task (BLOCKED)
 - ✅ **Zero CPU waste** - No polling loop
 - ✅ **Instant wake-up** - ISR immediately unblocks task
 - ✅ **Thread-safe** - Lock-free ISR-to-Task communication
+
+### Watchdog System (Deadlock Detection)
+
+**All tasks actively monitored:**
+
+```
+UART_task, CMD_Handler, Print_Task
+         ↓ Register & feed every 2 seconds
+  ┌─────────────────┐
+  │ Watchdog Task   │  Checks every 1 second
+  │  (Priority 4)   │  → If task hasn't fed in 5s → ALERT!
+  └─────────────────┘
+```
+
+**Implementation:**
+```c
+// All three tasks use finite timeouts for watchdog monitoring
+void uart_task_handler(void *parameters) {
+    watchdog_id_t wd_id = watchdog_register("UART_task", 5000);
+
+    while(1) {
+        // Finite 2s timeout (instead of portMAX_DELAY)
+        xStreamBufferReceive(buffer, &ch, 1, pdMS_TO_TICKS(2000));
+
+        watchdog_feed(wd_id);  // Prove I'm alive every 2s
+    }
+}
+```
+
+**Active Monitoring:**
+- ✅ **UART_task** - Feeds every 2s (5s timeout)
+- ✅ **CMD_Handler** - Feeds every 2s (5s timeout)
+- ✅ **Print_Task** - Feeds every 2s (5s timeout)
+
+**Detects:**
+- 🔍 Hung tasks (stuck in infinite loop)
+- 🔍 Deadlocked tasks (waiting on mutex forever)
+- 🔍 Crashed tasks (hard fault before feeding)
+- 🔍 Starved tasks (priority inversion)
+
+**See:** `WATCHDOG_USAGE.md` for complete guide
 
 ### Communication Flow
 
@@ -438,3 +481,11 @@ This project is for educational and personal use. Feel free to learn from, modif
 For questions or discussions about this project, please refer to the detailed [Architecture.md](Architecture.md) documentation.
 
 ---
+
+**Built with ❤️ for embedded systems learning and professional development**
+
+> 💡 **Want to understand the technical details?** Check out [Architecture.md](Architecture.md) for comprehensive documentation including task analysis, timing diagrams, design decisions, and lessons learned.
+
+**Last Updated:** December 2024
+**Status:** ✅ Complete and tested
+**Documentation:** 📚 [Architecture.md](Architecture.md) - 1000+ lines of technical details
