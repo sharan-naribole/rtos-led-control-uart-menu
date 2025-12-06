@@ -272,7 +272,13 @@ void uart_task_handler(void *parameters)
             watchdog_feed(wd_id);
         }
 
-        if (received > 0) {
+        // If timeout (no data received), continue to next iteration
+        if (received == 0) {
+            continue;
+        }
+
+        // Data received - process the character
+        {
             /*
              * Case 1: Command Complete (CR or LF)
              * User pressed Enter - process the complete command
