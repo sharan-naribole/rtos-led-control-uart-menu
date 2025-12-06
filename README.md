@@ -322,21 +322,22 @@ Enter selection:
 ## 📁 Project Structure
 
 ```
-014LedPatternsUartInput/
-├── Core/
-│   ├── Inc/
-│   │   ├── main.h
-│   │   ├── uart_task.h
-│   │   ├── print_task.h           ← Print task API (new)
-│   │   ├── command_handler.h
-│   │   └── led_effects.h
-│   ├── Src/
-│   │   ├── main.c                  ← Initialization & task creation
-│   │   ├── uart_task.c             ← Character RX & buffering
-│   │   ├── print_task.c            ← Print task implementation (new)
-│   │   ├── command_handler.c       ← Menu state machine
-│   │   ├── led_effects.c           ← LED pattern control
-│   │   └── stm32f4xx_it.c          ← Interrupt handlers
+rtos-led-control-uart-menu/
+├── includes/
+│   ├── main.h
+│   ├── uart_task.h
+│   ├── print_task.h           ← Print task API
+│   ├── command_handler.h
+│   ├── led_effects.h
+│   └── watchdog.h             ← Watchdog API
+├── src/
+│   ├── main.c                  ← Initialization & task creation
+│   ├── uart_task.c             ← Character RX & buffering
+│   ├── print_task.c            ← Print task implementation
+│   ├── command_handler.c       ← Menu state machine
+│   ├── led_effects.c           ← LED pattern control
+│   ├── watchdog.c              ← Watchdog implementation
+│   └── stm32f4xx_it.c          ← Interrupt handlers
 │   └── Startup/
 │       └── startup_stm32f407vgtx.s
 ├── Drivers/                         ← STM32 HAL & CMSIS

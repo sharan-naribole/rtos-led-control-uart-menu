@@ -7,12 +7,8 @@ Simple task watchdog implementation for detecting hung/deadlocked tasks in FreeR
 ## What Was Added
 
 ### Files Created:
-1. **`Core/Inc/watchdog.h`** - Watchdog API
-2. **`Core/Src/watchdog.c`** - Watchdog implementation
-
-### Projects Updated:
-- ✅ **014LedPatternsUartInput**
-- ✅ **015LedControlWifiServer**
+1. **`includes/watchdog.h`** - Watchdog API
+2. **`src/watchdog.c`** - Watchdog implementation
 
 ### Changes Made:
 1. Added `#include "watchdog.h"` to `main.c`
