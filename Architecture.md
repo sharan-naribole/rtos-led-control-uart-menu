@@ -1,1000 +1,796 @@
-# 014LedPatternsUartInput - System Architecture
-
-## Overview
-FreeRTOS-based LED pattern control application with UART command interface. The system uses multiple tasks, software timers, and queues for thread-safe operation.
-
-**Key Innovation:** A dedicated print task owns UART TX hardware exclusively, eliminating mutex protection and preventing race conditions. This architecture demonstrates professional embedded systems design with clean separation between UART RX (character reception) and UART TX (message output) operations.
-
-**Status:** ✅ Fully implemented and tested - all features working correctly.
+# Architecture Documentation
+## 014 LED Patterns UART Input - Stream Buffer + Multi-Task Design
 
 ---
 
-## 1. Task Architecture
+## System Overview
 
-### Task Hierarchy Diagram
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        FreeRTOS Scheduler                                │
-│                    (Preemptive, Tick: 1000Hz)                           │
-└─────────────────────────────────────────────────────────────────────────┘
-                                  │
-        ┌─────────────────────────┼─────────────────────────┬──────────────┐
-        │                         │                         │              │
- ┌──────▼──────┐   ┌──────────────▼────┐   ┌───────────────▼───┐   ┌─────▼─────┐
- │ UART Task   │   │ CMD Handler       │   │ Print Task        │   │Timer Svc  │
- │ Priority: 2 │   │ Priority: 2       │   │ Priority: 3       │   │Priority: 2│
- │ Stack: 512  │   │ Stack: 256        │   │ Stack: 512        │   │Stack: 260 │
- └─────────────┘   └───────────────────┘   └───────────────────┘   └───────────┘
-      │                     │                       │                     │
- Character            Command                  UART TX              LED Timer
- Reception            Processing               Exclusive            Callbacks
-                                               Owner
+This project demonstrates a **FreeRTOS architecture** featuring:
+1. **Stream Buffer UART RX** - Efficient interrupt-driven reception with task blocking
+2. **Dedicated Print Task** - Exclusive UART TX ownership
+3. **Multi-Task Command Processing** - Separation of reception, processing, and output
+4. **Interactive Menu System** - Hierarchical command interface
 
-┌────────▼────────┐
-│  Idle Task      │
-│  Priority: 0    │
-│  Stack: 130     │
-└─────────────────┘
-      │
- Power Save
- (WFI/SLEEP)
-```
-
-### Task Details
-
-#### 1. **UART Task** (`uart_task_handler`)
-- **Priority**: 2 (Same as Command Handler for balanced scheduling)
-- **Stack**: 512 words (2048 bytes)
-- **State**: Always ready (blocks on `HAL_UART_Receive()`)
-- **Function**: Character-by-character UART reception with echo
-- **Blocking Call**: `HAL_UART_Receive(&huart2, &received_char, 1, portMAX_DELAY)`
-- **Wakeup Event**: UART RX interrupt (character received)
-
-**Responsibilities:**
-- Receive characters from UART2 (PA3/RX)
-- Echo characters back to terminal
-- Buffer assembly (up to 32 characters)
-- Backspace handling
-- Command queue management
-- Notify Command Handler via task notification
-
-#### 2. **Command Handler Task** (`command_handler_task`)
-- **Priority**: 2 (Same as UART Task)
-- **Stack**: 256 words (1024 bytes)
-- **State**: Blocked waiting for notification
-- **Function**: Process commands and update LED patterns
-- **Blocking Call**: `ulTaskNotifyTake(pdTRUE, portMAX_DELAY)`
-- **Wakeup Event**: Task notification from UART Task
-
-**Responsibilities:**
-- Wait for task notification from UART task
-- Receive commands from queue
-- Parse and validate commands
-- Execute LED pattern changes
-- Print response messages
-- Manage menu state machine
-
-#### 3. **Print Task** (`print_task_handler`)
-- **Priority**: 3 (Highest application priority for responsive output)
-- **Stack**: 512 words (2048 bytes)
-- **State**: Blocked waiting for messages in print queue
-- **Function**: Exclusive owner of UART TX hardware
-- **Blocking Call**: `xQueueReceive(print_queue, message, portMAX_DELAY)`
-- **Wakeup Event**: Message available in print queue
-
-**Responsibilities:**
-- Receive print messages from queue (FIFO order)
-- Transmit messages via HAL_UART_Transmit()
-- **Exclusive UART TX access** (no other task may call HAL_UART_Transmit)
-- Handle character echo and all menu/response printing
-
-**Why Dedicated Print Task:**
-- **Non-blocking**: Application tasks enqueue and return immediately
-- **No priority inversion**: Queue-based synchronization more predictable than mutex
-- **Cleaner design**: Single point of UART TX control
-- **Scalable**: Easy to add features (buffering, timestamps, priorities)
-- **Responsive**: Priority 3 ensures immediate processing when messages queued
-- **Exclusive ownership**: Prevents race conditions from concurrent UART access
-
-#### 4. **Timer Service Task** (FreeRTOS Built-in)
-- **Priority**: 2 (configTIMER_TASK_PRIORITY)
-- **Stack**: 260 words (configMINIMAL_STACK_SIZE × 2)
-- **State**: Blocked waiting for timer events
-- **Function**: Execute software timer callbacks
-- **Queue**: Timer command queue (length: 10)
-
-**Responsibilities:**
-- Execute LED timer callbacks (led_timer1_callback, led_timer2_callback)
-- Process timer start/stop/period change commands
-- Toggle GPIO pins for LED patterns
-
-#### 5. **Idle Task** (FreeRTOS Built-in)
-- **Priority**: 0 (Lowest)
-- **Stack**: 130 words (configMINIMAL_STACK_SIZE)
-- **State**: Runs when no higher priority tasks ready
-- **Hook**: `vApplicationIdleHook()` - Executes WFI for power saving
-
----
-
-## 2. FreeRTOS Objects
-
-### Synchronization Primitives
-
-#### **print_queue** (Message Queue)
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    print_queue                               │
-│                FIFO Queue (10 slots)                         │
-│                Item Size: 512 bytes                          │
-└─────────────────────────────────────────────────────────────┘
-        │                                           │
-    xQueueSend()                             xQueueReceive()
-        │                                           │
-   ┌────▼─────┐                                ┌───▼──────┐
-   │   Any    │  ──── Messages (strings) ────> │  Print   │
-   │   Task   │                                 │   Task   │
-   └──────────┘                                 └──────────┘
-                                                     │
-                                                     ▼
-                                            HAL_UART_Transmit()
-                                              (Exclusive Access)
-```
-
-**Queue Parameters:**
-- **Depth**: 10 messages
-- **Item Size**: 512 bytes (PRINT_MESSAGE_MAX_SIZE)
-- **Type**: char[512] (null-terminated strings)
-- **Timeout**: 100ms on send (prevents deadlock)
-
-**Data Flow:**
-1. Application task needs to print: `print_message("Hello\r\n")`
-2. Message copied to queue: `xQueueSend(print_queue, message, 100ms)`
-3. Function returns immediately (non-blocking for caller)
-4. Print task wakes up: `xQueueReceive(print_queue, buffer, portMAX_DELAY)`
-5. Print task transmits: `HAL_UART_Transmit(&huart2, buffer, len, HAL_MAX_DELAY)`
-
-**Why Queue Instead of Mutex:**
-- ✓ **Non-blocking**: Tasks enqueue and return immediately (~20-50μs)
-- ✓ **No priority inversion**: Queue operations more predictable
-- ✓ **Separation**: Application tasks don't access UART hardware
-- ✓ **Scalable**: Easy to add features without changing callers
-- ✓ **Single owner**: Print task has exclusive UART TX access
-
-#### **command_queue** (Message Queue)
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    command_queue                             │
-│                    FIFO Queue (5 slots)                      │
-│                   Item Size: 32 bytes                        │
-└─────────────────────────────────────────────────────────────┘
-        │                                           │
-    xQueueSend()                             xQueueReceive()
-        │                                           │
-   ┌────▼────┐                                 ┌───▼──────┐
-   │  UART   │  ──── Commands (strings) ────>  │   CMD    │
-   │  Task   │                                  │ Handler  │
-   └─────────┘                                 └──────────┘
-```
-
-**Queue Parameters:**
-- **Depth**: 5 commands
-- **Item Size**: 32 bytes (COMMAND_MAX_LENGTH)
-- **Type**: char[32] (null-terminated strings)
-- **Timeout**: 100ms on send (prevents deadlock)
-
-**Data Flow:**
-1. UART task receives complete command (CR/LF)
-2. UART task sends to queue: `xQueueSend(command_queue, rx_buffer, 100ms)`
-3. UART task notifies handler: `xTaskNotifyGive(command_handler_task_handle)`
-4. CMD Handler wakes up: `ulTaskNotifyTake(pdTRUE, portMAX_DELAY)`
-5. CMD Handler receives: `xQueueReceive(command_queue, received_command, 0)`
-6. CMD Handler processes all queued commands in loop
-
-#### **Task Notification** (UART → CMD Handler)
-```
-UART Task                                    CMD Handler Task
-    │                                              │
-    │  1. Command complete (user pressed Enter)   │
-    │                                              │
-    │  2. xQueueSend(command_queue, command)      │
-    │         └──────────────────┐                │
-    │                            │                │
-    │  3. xTaskNotifyGive() ─────┼───────────────>│
-    │                            │                │
-    │                            │                │ (Wakes up)
-    │                            │                │
-    │                            │                │ 4. ulTaskNotifyTake()
-    │                            │                │
-    │                            │                │ 5. xQueueReceive()
-    │                            │                │
-    │                            └───────────────>│ 6. process_command()
-```
-
-**Why Task Notification:**
-- Lightweight synchronization (faster than semaphore)
-- Direct task-to-task signaling
-- No memory allocation overhead
-- Binary notification: "commands available, wake up"
-
----
-
-## 3. Software Timers
-
-### LED Control Timers
+### High-Level Architecture
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│                    Software Timer Architecture                    │
-└──────────────────────────────────────────────────────────────────┘
-
-    Timer 1 (led_timer1)              Timer 2 (led_timer2)
-    ┌──────────────┐                  ┌──────────────┐
-    │ Auto-reload  │                  │ Auto-reload  │
-    │ Period: var  │                  │ Period: var  │
-    │ (100-1000ms) │                  │ (100-1000ms) │
-    └──────┬───────┘                  └──────┬───────┘
-           │                                 │
-           │ Expires                         │ Expires
-           │                                 │
-           ▼                                 ▼
-    led_timer1_callback()          led_timer2_callback()
-           │                                 │
-           │                                 │
-           ▼                                 ▼
-    Toggle PD12 (Green)              Toggle PD13 (Orange)
-    HAL_GPIO_TogglePin()             HAL_GPIO_TogglePin()
-```
-
-### Timer Patterns
-
-| Pattern | Timer 1 (Green) | Timer 2 (Orange) | Visual Effect          |
-|---------|-----------------|------------------|------------------------|
-| NONE    | Stopped         | Stopped          | Both OFF               |
-| 1       | Stopped         | Stopped          | Both ON (static GPIO)  |
-| 2       | 100ms           | 1000ms           | Fast/Slow async blink  |
-| 3       | 100ms           | 100ms            | Synchronized fast blink|
-
-**Timer Service Task Flow:**
-```
-Timer Service Task (Priority 2)
-    │
-    ├─> Checks Timer Queue (blocking)
-    │   └─> Commands: Start, Stop, ChangePeriod
-    │
-    ├─> Maintains sorted timer list (by expiry time)
-    │
-    ├─> When timer expires:
-    │   ├─> Execute callback (led_timerX_callback)
-    │   ├─> If auto-reload: reschedule
-    │   └─> Return to blocked state
-    │
-    └─> Yield to higher priority tasks
-```
-
-**Important Notes:**
-- Callbacks run in Timer Service Task context (NOT ISR!)
-- Can call FreeRTOS APIs (non-ISR versions)
-- Keep callbacks short to avoid blocking other timers
-- HAL_GPIO_TogglePin() is atomic and ISR-safe
-
----
-
-## 4. Complete System Data Flow
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                          User Terminal                                   │
-│                    (screen /dev/tty.usbserial)                          │
-└────────────────────┬────────────────────────▲───────────────────────────┘
-                     │                        │
-              [Characters]              [Echo + Menus]
-                     │                        │
-            ┌────────▼────────────────────────┴────────────┐
-            │         UART2 (115200 baud, 8N1)             │
-            │         PA2: TX  │  PA3: RX                  │
-            └────────┬────────────────────▲─────────────────┘
-                     │                    │
-                RX IRQ fires         HAL_UART_Transmit()
-                     │                    │ (mutex protected)
-                     │                    │
-            ┌────────▼────────────────────┴─────────────────┐
-            │         UART Task (Priority 2)                │
-            │  - HAL_UART_Receive() [BLOCKING]              │
-            │  - Echo character                             │
-            │  - Build command buffer                       │
-            │  - Handle backspace/CR/LF                     │
-            └────────┬──────────────────────────────────────┘
-                     │
-          Complete command (Enter pressed)
-                     │
-         ┌───────────┴───────────────┐
-         │                           │
-         │  xQueueSend()            │ xTaskNotifyGive()
-         │  (command_queue)         │ (wake up handler)
-         ▼                           ▼
-    ┌──────────┐              ┌──────────────────┐
-    │  Queue   │──────────────>│ CMD Handler Task │
-    │ (5 cmds) │ xQueueReceive │   (Priority 2)   │
-    └──────────┘              └────────┬─────────┘
-                                       │
-                             process_command()
-                             trim/lowercase
-                                       │
-                        ┌──────────────┼──────────────┐
-                        │              │              │
-                    Menu State     LED Pattern    Response
-                    Transition     Change via:    Messages
-                        │          led_effects_   (mutex)
-                        │          set_pattern()      │
-                        │              │              │
-                        ▼              ▼              ▼
-                  State Machine   ┌────────────┐   UART TX
-                  (MENU_MAIN,     │  Pattern   │
-                   MENU_LED_      │  Handler   │
-                   PATTERNS)      └─────┬──────┘
-                                        │
-                        ┌───────────────┼───────────────┐
-                        │               │               │
-                   Stop Timers    Change Period    Start Timers
-                        │               │               │
-                        ▼               ▼               ▼
-                  xTimerStop()   xTimerChangePeriod() xTimerStart()
-                        │               │               │
-                        └───────────────┴───────────────┘
-                                        │
-                                        ▼
-                        ┌────────────────────────────────┐
-                        │   Timer Command Queue (len:10) │
-                        └───────────┬────────────────────┘
-                                    │
-                                    ▼
-                        ┌───────────────────────────────┐
-                        │   Timer Service Task (Pri:2)  │
-                        │   - Process timer commands    │
-                        │   - Maintain timer list       │
-                        │   - Execute callbacks         │
-                        └────────┬──────────────────────┘
-                                 │
-                    ┌────────────┴────────────┐
-                    │                         │
-                    ▼                         ▼
-            led_timer1_callback      led_timer2_callback
-                    │                         │
-                    ▼                         ▼
-        HAL_GPIO_TogglePin(PD12)   HAL_GPIO_TogglePin(PD13)
-                    │                         │
-                    ▼                         ▼
-            Green LED (LD4)             Orange LED (LD3)
+│                         User Terminal                             │
+└───────────┬─────────────────────────────────────────┬────────────┘
+            │ UART RX (PA3)                  UART TX (PA2) │
+            ↓                                               ↑
+     ┌─────────────┐                               ┌───────────────┐
+     │  RX ISR     │                               │  Print Task   │
+     └──────┬──────┘                               └───────↑───────┘
+            │                                              │
+            ↓                                              │
+     ┌─────────────┐                               ┌───────────────┐
+     │ Stream      │                               │ Print Queue   │
+     │ Buffer      │                               │ (10 messages) │
+     └──────┬──────┘                               └───────↑───────┘
+            │                                              │
+            ↓                                              │
+     ┌─────────────┐        ┌──────────────┐             │
+     │  UART Task  │ ────> │ Command Queue│ ──┐          │
+     │  (BLOCKED)  │        └──────────────┘   │          │
+     └─────────────┘                            ↓          │
+                                         ┌──────────────┐  │
+                                         │   Command    │──┘
+                                         │   Handler    │
+                                         └──────┬───────┘
+                                                │
+                                                ↓
+                                         ┌──────────────┐
+                                         │ LED Effects  │
+                                         │  (Timers)    │
+                                         └──────────────┘
 ```
 
 ---
 
-## 5. Interrupt Configuration
+## Stream Buffer Architecture (NEW!)
 
-### UART2 RX Interrupt
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    NVIC Configuration                        │
-└─────────────────────────────────────────────────────────────┘
+### The Problem
 
-Interrupt: USART2_IRQn
-Priority: Configurable (below configMAX_SYSCALL_INTERRUPT_PRIORITY)
-Handler: USART2_IRQHandler() [in stm32f4xx_it.c]
-    │
-    ├─> HAL_UART_IRQHandler(&huart2)
-    │       │
-    │       ├─> Check RXNE flag
-    │       ├─> Read DR register
-    │       └─> Store in HAL internal buffer
-    │
-    └─> Unblock HAL_UART_Receive() in UART Task
-            │
-            └─> Task becomes READY, scheduler runs
-```
-
-**Key Points:**
-- UART RX interrupt unblocks `HAL_UART_Receive()`
-- No direct FreeRTOS API calls in ISR (HAL handles it)
-- Task wakeup is implicit via HAL mechanism
-- ISR priority MUST be ≥ configMAX_SYSCALL_INTERRUPT_PRIORITY (5)
-
-### SysTick Interrupt (FreeRTOS Tick)
-```
-Interrupt: SysTick_IRQn
-Frequency: 1000 Hz (1ms tick)
-Priority: Lowest (15 - configKERNEL_INTERRUPT_PRIORITY)
-Handler: SysTick_Handler()
-    │
-    ├─> HAL_IncTick() (HAL timebase)
-    └─> xPortSysTickHandler() (FreeRTOS scheduler tick)
-            │
-            ├─> Increment tick count
-            ├─> Check for task timeouts (vTaskDelay, queue timeouts)
-            ├─> Decrement timer countdowns
-            ├─> Update blocked task lists
-            └─> Trigger context switch if needed (PendSV)
-```
-
-### Interrupt Priority Levels (STM32F4)
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│         Interrupt Priority Configuration (4 bits)           │
-│         Higher Number = Lower Priority                      │
-└─────────────────────────────────────────────────────────────┘
-
-Priority    │ Usage                          │ Can Call FreeRTOS APIs?
-────────────┼────────────────────────────────┼────────────────────────
-0-4         │ High Priority ISRs             │ NO
-            │ (Critical, no RTOS calls)      │
-────────────┼────────────────────────────────┼────────────────────────
-5           │ configMAX_SYSCALL_IRQ_PRIORITY │ YES (FromISR APIs)
-            │ (UART2, safe for RTOS)         │
-────────────┼────────────────────────────────┼────────────────────────
-6-14        │ Lower priority ISRs            │ YES (FromISR APIs)
-────────────┼────────────────────────────────┼────────────────────────
-15          │ configKERNEL_INTERRUPT_PRIORITY│ (FreeRTOS Internal)
-            │ (SysTick, PendSV, SVC)         │
-────────────┴────────────────────────────────┴────────────────────────
-```
-
----
-
-## 6. Memory Map
-
-### Heap and Stack Allocation
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                   FreeRTOS Heap (75 KB)                      │
-│                   (configTOTAL_HEAP_SIZE)                    │
-└─────────────────────────────────────────────────────────────┘
-    │
-    ├─> Task Stacks:
-    │   ├─> UART Task:        512 words = 2048 bytes
-    │   ├─> CMD Handler:      256 words = 1024 bytes
-    │   ├─> Print Task:       512 words = 2048 bytes
-    │   ├─> Timer Service:    260 words = 1040 bytes
-    │   └─> Idle Task:        130 words =  520 bytes
-    │                                      ─────────────
-    │                                      6680 bytes
-    │
-    ├─> FreeRTOS Objects:
-    │   ├─> command_queue:    ~200 bytes (5×32 + overhead)
-    │   ├─> print_queue:      ~5200 bytes (10×512 + overhead)
-    │   ├─> led_timer1:       ~50 bytes
-    │   ├─> led_timer2:       ~50 bytes
-    │   └─> Task TCBs:        ~600 bytes (5 tasks × ~120 bytes)
-    │                         ─────────────
-    │                         ~6100 bytes
-    │
-    └─> Total Used: ~12.8 KB / 75 KB (17% utilization)
-        Remaining: ~62 KB for future expansion
-```
-
-### Static Buffers (BSS/DATA)
-
-```
-Module          │ Buffer              │ Size      │ Purpose
-────────────────┼─────────────────────┼───────────┼──────────────────
-uart_task.c     │ rx_buffer           │ 128 bytes │ Command assembly
-command_handler │ received_command    │ 32 bytes  │ Queue receive buf
-command_handler │ response            │ 128 bytes │ Response messages
-────────────────┴─────────────────────┴───────────┴──────────────────
-Total Static Buffers: 288 bytes
-```
-
----
-
-## 7. Timing Analysis
-
-### Worst-Case Response Times
-
-#### **Character Echo Latency**
-```
-User types character
-    │
-    └─> UART RX interrupt: ~1 μs
-        └─> HAL_UART_Receive() unblocks: ~10 μs
-            └─> UART Task resumes (if higher pri running): ~20 μs
-                └─> HAL_UART_Transmit(echo): ~87 μs @ 115200 baud
-                    └─> Total: ~120 μs (imperceptible)
-```
-
-#### **Command Processing Latency**
-```
-User presses Enter
-    │
-    └─> Command buffered: ~1 μs
-        └─> xQueueSend(): ~50 μs
-            └─> xTaskNotifyGive(): ~20 μs
-                └─> CMD Handler unblocks: ~30 μs
-                    └─> process_command(): ~100 μs
-                        └─> led_effects_set_pattern(): ~200 μs
-                            └─> Menu print: ~5 ms (600 bytes @ 115200)
-                                └─> Total: ~5.4 ms (very responsive)
-```
-
-#### **LED Pattern Change Latency**
-```
-Command processed
-    │
-    └─> led_effects_set_pattern() called
-        └─> xTimerStop(): ~50 μs
-            └─> xTimerChangePeriod(): ~100 μs
-                └─> Timer Service Task processes: ~200 μs
-                    └─> GPIO toggle in callback: ~1 μs
-                        └─> Total: ~350 μs (instantaneous to human eye)
-```
-
-### Task Execution Frequencies
-
-| Task             | Frequency                  | CPU Load (approx) |
-|------------------|----------------------------|-------------------|
-| UART Task        | On character RX (~10 Hz)   | < 1%              |
-| CMD Handler      | On command (~0.1 Hz)       | < 0.1%            |
-| Timer Service    | Variable (100ms-1000ms)    | < 0.5%            |
-| Idle Task        | Runs when CPU idle         | ~98%              |
-| **Total**        | **-**                      | **~100%**         |
-
-**Conclusion**: System is very lightly loaded. CPU spends ~98% in idle/sleep mode.
-
----
-
-## 8. Power Management
-
-### Idle Hook Strategy
-
+**HAL_UART_Receive() is NOT truly blocking:**
 ```c
-void vApplicationIdleHook(void)
-{
-    // Execute ARM WFI (Wait For Interrupt) instruction
-    // Puts CPU in SLEEP mode until next interrupt
-    __WFI();
+// What you think happens:
+HAL_UART_Receive(&huart2, &ch, 1, portMAX_DELAY);  // Task blocks, yields CPU?
+
+// What actually happens:
+while (!UART_DATA_READY) {
+    // Task stays RUNNING, polls flag in tight loop!
+    // CPU wasted checking flag repeatedly
 }
 ```
 
-**Power Saving Mechanism:**
-1. When no tasks ready, Idle Task runs (priority 0)
-2. Idle hook executes `__WFI()` instruction
-3. CPU enters SLEEP mode:
-   - CPU clock stopped
-   - Peripherals keep running (UART, timers)
-   - Flash interface, SRAM accessible
-4. Any interrupt wakes CPU:
-   - UART RX interrupt
-   - SysTick (every 1ms)
-   - Timer expirations
-5. CPU resumes, scheduler runs
-
-**Power Consumption Estimate:**
-- Active (processing command): ~80 mA
-- Sleep mode (98% of time): ~20 mA
-- Average: ~22 mA (72% power reduction)
+**Issues:**
+- ❌ Task remains in RUNNING state (not BLOCKED)
+- ❌ CPU cycles wasted polling
+- ❌ Less efficient power consumption
 
 ---
 
-## 9. Thread Safety Analysis
-
-### Print Task Architecture
-
-**Key Design Principle:** Print task has **EXCLUSIVE** ownership of UART TX hardware.
+### The Solution: Stream Buffer + Interrupt
 
 ```
-Function                      │ How Protected?     │ Mechanism
-──────────────────────────────┼────────────────────┼──────────────────────
-Character echo                │ print_char()       │ Via print queue
-print_welcome_message()       │ print_message()    │ Via print queue
-print_main_menu()             │ print_message()    │ Via print queue
-print_led_patterns_menu()     │ print_message()    │ Via print queue
-Error messages (overflow)     │ print_message()    │ Via print queue
-Backspace sequence            │ print_message()    │ Via print queue
-Response messages             │ print_message()    │ Via print queue
-LED timer callbacks           │ N/A                │ GPIO only, no UART
-──────────────────────────────┴────────────────────┴──────────────────────
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│  UART RX ISR │ ──> │Stream Buffer │ ──> │  UART Task   │
+│  (~2μs)      │     │ (Lock-free)  │     │  (BLOCKED)   │
+└──────────────┘     └──────────────┘     └──────────────┘
+   Instant wake           Thread-safe        Yields CPU!
 ```
 
-**No Race Conditions Possible:**
-```
-Time  │ UART Task               │ CMD Handler Task     │ Print Task
-──────┼─────────────────────────┼──────────────────────┼────────────────────
-T0    │ print_message("Enter")  │                      │ [Blocked on queue]
-T1    │ [Returns immediately]   │                      │ Receives "Enter"
-T2    │                         │ print_message("MENU")│ TX: "Enter"
-T3    │                         │ [Returns immediately]│ TX complete
-T4    │                         │                      │ Receives "MENU"
-T5    │                         │                      │ TX: "MENU"
-──────┴─────────────────────────┴──────────────────────┴────────────────────
-Result: "Enter" then "MENU" in correct order ✅ ALWAYS CORRECT!
+**How it works:**
+
+1. **Initialization:**
+```c
+uart_stream_buffer = xStreamBufferCreate(128, 1);
+HAL_UART_Receive_IT(&huart2, &uart_rx_byte, 1);
 ```
 
-**Why This Design is Superior:**
-- ✓ **Impossible to corrupt**: Only one task accesses UART hardware
-- ✓ **Non-blocking**: Application tasks enqueue and return quickly
-- ✓ **FIFO ordering**: Messages print in the order they were sent
-- ✓ **No deadlock risk**: Queue has timeout, print task never blocks permanently
-- ✓ **Simpler code**: No mutex take/give boilerplate in 10+ locations
+2. **ISR deposits byte:**
+```c
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    xStreamBufferSendFromISR(uart_stream_buffer, &uart_rx_byte, 1, &woken);
+    HAL_UART_Receive_IT(&huart2, &uart_rx_byte, 1);
+    portYIELD_FROM_ISR(woken);
+}
+```
+
+3. **Task reads (TRUE BLOCKING):**
+```c
+void uart_task_handler(void *parameters)
+{
+    while(1) {
+        // Task enters BLOCKED state, yields CPU!
+        xStreamBufferReceive(uart_stream_buffer, &ch, 1, portMAX_DELAY);
+
+        // Wakes here when ISR deposits byte
+        process_character(ch);
+    }
+}
+```
+
+**Benefits:**
+- ✅ **TRUE blocking** - Task enters BLOCKED state, yields CPU to other tasks
+- ✅ **Zero CPU waste** - No polling loop
+- ✅ **Instant wake-up** - ISR immediately unblocks task (<10μs latency)
+- ✅ **Thread-safe** - Lock-free ISR-to-Task communication
+- ✅ **Production-quality** - Proper RTOS design pattern
 
 ---
 
-## 10. Menu State Machine
+## Dedicated Print Task Architecture
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                     Menu State Machine                            │
-└──────────────────────────────────────────────────────────────────┘
+### Why Not Use Mutexes?
 
-                    ┌──────────────────┐
-        ┌───────────│   MENU_MAIN      │◄──────────────┐
-        │           │  (State = 0)     │               │
-        │           └────────┬─────────┘               │
-        │                    │                         │
-        │ Cmd: "2"          │ Cmd: "1"                │ Cmd: "0"
-        │ (Exit App)        │ (LED Patterns)          │ (Return)
-        │                    │                         │
-        ▼                    ▼                         │
-   Stop LEDs         ┌────────────────┐               │
-   Print "Exit"      │ MENU_LED_      │───────────────┘
-   Stay in MAIN      │ PATTERNS       │
-                     │ (State = 1)    │
-                     └────────┬───────┘
-                              │
-           ┌──────────────────┼──────────────────┬───────────────┐
-           │                  │                  │               │
-      Cmd: "1"           Cmd: "2"           Cmd: "3"        Cmd: "4"
-      (All ON)           (Async Blink)     (Sync Blink)    (All OFF)
-           │                  │                  │               │
-           ▼                  ▼                  ▼               ▼
-      Pattern 1          Pattern 2          Pattern 3       Pattern NONE
-      Print msg          Print msg          Print msg       Print msg
-      Redisplay          Redisplay          Redisplay       Redisplay
-      LED menu           LED menu           LED menu        LED menu
+**Traditional mutex approach:**
+```c
+// In every task that prints...
+xSemaphoreTake(uart_mutex, portMAX_DELAY);
+HAL_UART_Transmit(&huart2, msg, len, timeout);  // Task blocks here!
+xSemaphoreGive(uart_mutex);
 ```
 
-**State Variable:**
-- Type: `MenuState_t` (enum)
-- Location: `command_handler.c` (static, single task access)
-- Values: `MENU_MAIN (0)`, `MENU_LED_PATTERNS (1)`
-- Thread Safety: No protection needed (only modified by CMD Handler)
+**Problems:**
+- Priority inversion issues
+- Task blocking during TX
+- Mutex boilerplate repeated everywhere
+- Complex error handling
+- Harder to maintain
 
 ---
 
-## 11. Build Configuration
+### Our Solution: Dedicated Print Task
 
-### Key FreeRTOS Settings
+**From ANY task - simple, non-blocking:**
+```c
+print_message("Hello World\r\n");  // Returns immediately!
+print_char('A');                    // ~20-50μs, no blocking
+```
 
-| Parameter                              | Value     | Impact                     |
-|----------------------------------------|-----------|----------------------------|
-| configUSE_PREEMPTION                   | 1         | Preemptive scheduling      |
-| configCPU_CLOCK_HZ                     | 168 MHz   | System clock (HSE+PLL)     |
-| configTICK_RATE_HZ                     | 1000      | 1ms tick period            |
-| configMAX_PRIORITIES                   | 5         | Priority levels 0-4        |
-| configTOTAL_HEAP_SIZE                  | 75 KB     | FreeRTOS heap              |
-| configUSE_MUTEXES                      | 1         | Enable mutex support       |
-| configUSE_TIMERS                       | 1         | Enable software timers     |
-| configTIMER_TASK_PRIORITY              | 2         | Timer service priority     |
-| configUSE_IDLE_HOOK                    | 1         | Enable idle hook (WFI)     |
-| configMAX_SYSCALL_INTERRUPT_PRIORITY   | 5         | ISR FreeRTOS API threshold |
+**Architecture:**
+```
+┌────────────┐     ┌─────────────┐     ┌─────────────┐
+│  Any Task  │ ──> │ Print Queue │ ──> │ Print Task  │
+│            │     │  (FIFO)     │     │ (Priority 3)│
+└────────────┘     └─────────────┘     └──────┬──────┘
+  Enqueue ~20μs       Thread-safe              │
+  Returns!                                     ↓
+                                        UART TX Exclusive
+                                         Owner (PA2)
+```
+
+**Benefits:**
+- ✅ Non-blocking (enqueue ~20-50μs, return immediately)
+- ✅ No priority inversion (queue-based synchronization)
+- ✅ Clean API (no mutex boilerplate in 10+ locations)
+- ✅ FIFO ordering guaranteed
+- ✅ Single point of control (easy to extend)
+- ✅ Better testability
 
 ---
 
-## 12. Hardware Connections
+## Complete Data Flow
+
+### User Types "1" → LED Pattern Activates
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    STM32F407VG Pinout                            │
-└─────────────────────────────────────────────────────────────────┘
-
-USART2:
-    PA2 (TX) ──────> FTDI RX  (Yellow wire)
-    PA3 (RX) <────── FTDI TX  (Orange wire)
-    GND      ──────> FTDI GND (Black wire)
-
-LEDs (Active High):
-    PD12 ──────> Green LED  (LD4)
-    PD13 ──────> Orange LED (LD3)
-    PD14 ──────> Red LED    (LD5) - Unused
-    PD15 ──────> Blue LED   (LD6) - Unused
-
-User Button:
-    PA0  ──────> Blue button (B1) - Unused in this project
-
-Debug (SWD):
-    PA13 ──────> SWDIO
-    PA14 ──────> SWCLK
+┌─────────────────────────────────────────────────────────────┐
+│ Step 1: User Types '1'                                       │
+└──────────────────────────────┬──────────────────────────────┘
+                               ↓
+                        UART RX (PA3)
+                               ↓
+┌──────────────────────────────────────────────────────────────┐
+│ Step 2: ISR Executes                                          │
+│  HAL_UART_RxCpltCallback() → xStreamBufferSendFromISR()      │
+│  Time: ~2μs                                                   │
+└──────────────────────────────┬───────────────────────────────┘
+                               ↓
+                        Stream Buffer
+                               ↓
+┌──────────────────────────────────────────────────────────────┐
+│ Step 3: UART Task Wakes                                       │
+│  xStreamBufferReceive() returns → print_char('1') → buffer   │
+│  Time: ~10μs wake + ~20μs enqueue                            │
+└──────────────────────────────┬───────────────────────────────┘
+                               ↓
+                          Print Queue
+                               ↓
+┌──────────────────────────────────────────────────────────────┐
+│ Step 4: Print Task Executes                                   │
+│  HAL_UART_Transmit() → Echo '1' to terminal                  │
+│  Time: ~87μs @ 115200 baud                                   │
+└───────────────────────────────────────────────────────────────┘
+                               ↓
+┌──────────────────────────────────────────────────────────────┐
+│ Step 5: User Presses Enter                                    │
+│  ISR → Stream Buffer → UART Task                              │
+└──────────────────────────────┬───────────────────────────────┘
+                               ↓
+                        Command Complete!
+                               ↓
+┌──────────────────────────────────────────────────────────────┐
+│ Step 6: UART Task Sends to Command Queue                      │
+│  xQueueSend(command_queue, "1") → xTaskNotifyGive()          │
+└──────────────────────────────┬───────────────────────────────┘
+                               ↓
+                         Command Queue
+                               ↓
+┌──────────────────────────────────────────────────────────────┐
+│ Step 7: Command Handler Wakes                                 │
+│  Processes "1" → Changes LED pattern → Prints response        │
+└──────────────────────────────┬───────────────────────────────┘
+                               ↓
+                          Print Queue
+                               ↓
+┌──────────────────────────────────────────────────────────────┐
+│ Step 8: Response Printed                                      │
+│  "Pattern 1 activated\r\n" → User sees feedback               │
+└───────────────────────────────────────────────────────────────┘
 ```
 
-**FTDI Adapter:**
-- Model: FT232RL USB to TTL Serial Converter
-- Baud Rate: 115200
-- Configuration: 8N1 (8 bits, no parity, 1 stop bit)
-- Flow Control: None
-- Device: `/dev/tty.usbserial-A5069RR4`
+**Total Time:** ~200μs from keystroke to echo + LED activation
 
 ---
 
-## 13. Testing and Validation
+## Task Priority & Scheduling
 
-### Test Scenarios
+| Task | Priority | Stack | Function | Blocking Point |
+|------|----------|-------|----------|----------------|
+| **Print Task** | 3 (highest) | 512 words | UART TX | `xQueueReceive` on print_queue |
+| **UART Task** | 2 | 1024 words | UART RX via stream buffer | `xStreamBufferReceive` |
+| **Command Handler** | 2 | 1024 words | Command processing | `ulTaskNotifyTake` |
+| **Timer Service** | 2 | 512 words | LED timer callbacks | Event-driven |
+| **Idle Task** | 0 (lowest) | Auto | Power save (WFI) | Runs when all blocked |
 
-#### **1. Basic Command Flow**
+**Why Print Task has highest priority:**
+- Ensures responsive user feedback
+- Prevents print queue overflow
+- Short execution time (just UART TX)
+- Higher priority than command processing
+
+---
+
+## Memory Layout
+
+### Heap Usage
+
+| Object | Size | Location |
+|--------|------|----------|
+| **Stream buffer storage** | 128 bytes | Heap |
+| **Stream buffer control** | ~24 bytes | Heap |
+| **Command queue** (5 × 32 bytes) | 160 bytes | Heap |
+| **Print queue** (10 × 512 bytes) | 5120 bytes | Heap |
+| **UART task stack** | 1024 bytes | Heap |
+| **Command handler stack** | 1024 bytes | Heap |
+| **Print task stack** | 512 bytes | Heap |
+| **Timer service stack** | 512 bytes | Heap |
+| **LED timer objects** | ~200 bytes | Heap |
+| **Total** | **~8.7 KB** | **17% of 75KB heap** |
+
+**Remaining:** ~62 KB (83%) available for expansion
+
+---
+
+## Performance Analysis
+
+### UART RX Latency
+
+**From byte arrival to task processing:**
+1. UART hardware interrupt: ~1-2 μs
+2. ISR execution (stream buffer send): ~1-2 μs
+3. Context switch to UART task: ~5-10 μs
+4. Task resumes execution: immediate
+
+**Total: ~10-15 μs** 🚀
+
+**vs. Polling mode:** Up to 1 ms (FreeRTOS tick period) worst-case delay
+
+---
+
+### CPU Utilization
+
+**Idle State (no user input):**
 ```
-Input:  "1" + Enter (Main menu → LED Patterns)
-Flow:   UART Task → Queue → CMD Handler → State change → Print LED menu
-Verify: Menu displays correctly, state = MENU_LED_PATTERNS
+UART Task:        BLOCKED (0% CPU)
+Command Handler:  BLOCKED (0% CPU)
+Print Task:       BLOCKED (0% CPU)
+Timer Service:    SUSPENDED (0% CPU)
+Idle Task:        RUNNING (~98% → enters WFI sleep mode)
 ```
 
-#### **2. LED Pattern Change**
+**Active Input (user typing at 60 WPM):**
 ```
-Input:  "2" + Enter (in LED menu → Pattern 2)
-Flow:   CMD Handler → led_effects_set_pattern(2) → Timer config → GPIO toggle
-Verify: Green blinks 10 Hz, Orange blinks 1 Hz
-```
+Each keystroke: ~50 μs total processing
+  - ISR overhead: ~2 μs
+  - Task wake/process: ~48 μs
 
-#### **3. Mutex Protection**
-```
-Test:   Rapid command entry while menu printing
-Method: Type "1" quickly during welcome message
-Verify: No text corruption, all text readable
-```
-
-#### **4. Buffer Overflow**
-```
-Input:  Type 130 characters without pressing Enter
-Flow:   UART Task detects overflow at 128 chars
-Verify: Error message printed, buffer reset
-```
-
-#### **5. Backspace Handling**
-```
-Input:  "123" + Backspace + Backspace + "4" + Enter
-Flow:   Buffer becomes "14", command processed
-Verify: Terminal shows correct backspace visualization
-```
-
-#### **6. Invalid Command**
-```
-Input:  "99" + Enter
-Flow:   CMD Handler → Invalid check → Error message → Redisplay menu
-Verify: "Invalid option" printed, menu redisplayed
+Average CPU: < 0.1%
+Power state: >99% in low-power WFI
 ```
 
 ---
 
-## 14. Performance Metrics
+## FreeRTOS Primitives Deep Dive
 
-### Resource Utilization
+### 1. Stream Buffer (UART RX)
 
+**Why Stream Buffer vs Queue?**
+
+| Feature | Stream Buffer | Queue |
+|---------|---------------|-------|
+| **Data type** | Raw byte stream | Fixed-size messages |
+| **Use case** | UART, SPI, I2C data | Commands, events |
+| **Overhead** | Lower (continuous data) | Higher (per-item metadata) |
+| **ISR-safe** | Yes | Yes |
+| **Lock-free** | Yes (single producer/consumer) | Yes |
+| **Best for** | Variable-length streams | Discrete messages |
+
+**Implementation:**
+```c
+// Creation
+StreamBufferHandle_t buffer = xStreamBufferCreate(
+    128,  // Buffer size in bytes
+    1     // Trigger level (wake on 1+ bytes)
+);
+
+// ISR write (producer)
+size_t sent = xStreamBufferSendFromISR(buffer, &data, 1, &woken);
+
+// Task read (consumer)
+size_t received = xStreamBufferReceive(buffer, &data, 1, portMAX_DELAY);
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                   Resource Usage Summary                          │
-└──────────────────────────────────────────────────────────────────┘
 
-Flash (Code):        ~25 KB / 1024 KB  (2.4%)
-RAM (Static):        ~0.3 KB / 192 KB  (0.15%)
-Heap (Dynamic):      ~5.5 KB / 75 KB   (7%)
-CPU Load:            ~2% active, 98% idle
-Worst-case Latency:  5.4 ms (command to menu display)
-Average Response:    120 μs (character echo)
-Power (Average):     ~22 mA @ 3.3V
+**Key Point:** Stream buffers are **perfect for UART** because:
+- Data is a continuous byte stream (not discrete messages)
+- Lower RAM overhead than queues
+- Simpler API for byte-by-byte reception
+- Lock-free with single producer (ISR) and single consumer (task)
+
+---
+
+### 2. Queue (Commands & Print Messages)
+
+**Command Queue:**
+```c
+// Small fixed-size commands
+QueueHandle_t command_queue = xQueueCreate(
+    5,   // Queue depth
+    32   // Item size (bytes)
+);
 ```
 
-### Scalability
+**Print Queue:**
+```c
+// Larger variable-length messages
+typedef struct {
+    msg_type_t msg_type;
+    char message[512];
+} print_msg_t;
 
-**Current Headroom:**
-- Heap: 69.5 KB available
-- Flash: 999 KB available
-- Priorities: 3 unused levels (3, 4)
-- Queue slots: Rarely exceeds 2/5
-- Stack: All tasks <50% utilized
-
-**Expansion Possibilities:**
-- Add more LED patterns (trivial)
-- Add UART1 for second interface (~1 KB flash, 2 KB heap)
-- Add LCD display task (~5 KB flash, 10 KB heap)
-- Add sensor reading tasks (~2 KB flash, 2 KB heap each)
-- Add Bluetooth/WiFi module (~20 KB flash, 15 KB heap)
+QueueHandle_t print_queue = xQueueCreate(
+    10,                // Queue depth
+    sizeof(print_msg_t)  // Item size
+);
+```
 
 ---
 
-## 15. Troubleshooting Guide
+### 3. Task Notification (Command Handler Wake-up)
 
-### Common Issues
+```c
+TaskHandle_t command_handler_task_handle;
 
-#### **Issue: "Enter selpication" text corruption**
-- **Cause**: Terminal connected during STM32 power-up
-- **Solution**: Connect screen FIRST, then press RESET button
-- **Technical**: UART peripheral has glitches during power-on
+// UART Task notifies (sender)
+xTaskNotifyGive(command_handler_task_handle);
 
-#### **Issue: No response to commands**
-- **Check**: Command handler task created? (`uart_task_init()` called?)
-- **Check**: Queue created successfully? (check `configASSERT()`)
-- **Debug**: Add `SEGGER_SYSVIEW_PrintfTarget()` in command handler
+// Command Handler waits (receiver)
+uint32_t notification_value = ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+```
 
-#### **Issue: LEDs not blinking**
-- **Check**: `led_effects_init()` called before scheduler?
-- **Check**: Timer service task priority (should be 2)
-- **Debug**: Verify `xTimerStart()` returns pdPASS
-
-#### **Issue: Menu text interleaved/garbled**
-- **Cause**: Missing mutex protection
-- **Check**: All `HAL_UART_Transmit()` wrapped in mutex?
-- **Solution**: Add `xSemaphoreTake/Give` around transmit calls
-
-#### **Issue: Buffer overflow on startup**
-- **Cause**: UART RX buffer not cleared after init
-- **Solution**: Already fixed with `memset()` and flush loop
-- **Verify**: Check uart_task.c:161-172
+**Why Task Notification instead of Semaphore?**
+- ✅ ~45% faster than binary semaphore
+- ✅ Lower RAM overhead (uses task's notification value)
+- ✅ Simpler API
+- ✅ Built into task control block (no separate object)
 
 ---
 
-## 16. Future Enhancements
+## Thread Safety Analysis
 
-### Possible Improvements
+### No Race Conditions
 
-1. **Dynamic Pattern Creation**
-   - User-configurable timer periods
-   - Save patterns to flash (EEPROM emulation)
+**UART RX:**
+```
+ISR (producer) → Stream Buffer → UART Task (consumer)
+```
+- ✅ Single producer (ISR only)
+- ✅ Single consumer (UART Task only)
+- ✅ Lock-free stream buffer guarantees atomicity
 
-2. **Advanced Menus**
-   - Help command ("?")
-   - Command history (up/down arrows)
-   - Tab completion
+**UART TX:**
+```
+Multiple Tasks → Print Queue → Print Task (exclusive TX owner)
+```
+- ✅ Queue provides thread-safe enqueue
+- ✅ Only Print Task calls HAL_UART_Transmit()
+- ✅ No mutex needed!
 
-3. **RTOS Statistics**
-   - Runtime stats menu (vTaskGetRunTimeStats)
-   - Stack high water mark monitoring
-   - CPU utilization per task
-
-4. **Error Handling**
-   - Watchdog timer integration
-   - Stack overflow detection (configCHECK_FOR_STACK_OVERFLOW)
-   - Malloc failed hook
-
-5. **Communication**
-   - DMA for UART (reduce CPU overhead)
-   - Multiple UART interfaces
-   - USB CDC virtual COM port
+**Command Processing:**
+```
+UART Task → Command Queue → Command Handler
+```
+- ✅ Single producer (UART Task)
+- ✅ Single consumer (Command Handler)
+- ✅ Queue ensures FIFO ordering
 
 ---
 
-## 17. Design Decisions and Implementation Notes
+## Comparison: Before vs After Stream Buffer
 
-### Print Task Architecture Evolution
+### Before (Polling Mode)
 
-**Initial Approach (Mutex-based):**
-- Multiple tasks calling `HAL_UART_Transmit()` protected by mutex
-- Problem: Priority inversion, blocking delays, complex error handling
+```c
+void uart_task_handler(void *parameters)
+{
+    while(1) {
+        // Task stays RUNNING, polls UART flag
+        HAL_UART_Receive(&huart2, &ch, 1, portMAX_DELAY);
 
-**Final Approach (Dedicated Print Task):**
-- Single task owns UART TX hardware exclusively
-- All other tasks use `print_message()` / `print_char()` APIs
-- Queue-based, non-blocking, FIFO ordering guaranteed
+        // Under the hood: tight polling loop
+        // while (!UART_RXNE) { /* CPU waste */ }
 
-### Critical Configuration Values
+        print_char(ch);
+        // ...
+    }
+}
+```
 
-**Print Message Buffer Size: 512 bytes**
-- Reason: LED Pattern menu is ~320 characters
-- Must accommodate longest menu with headroom
-- Truncation at 256 bytes caused "Enter selection:" to be cut off
+**Characteristics:**
+- ❌ Task remains in RUNNING state (not truly blocked)
+- ❌ CPU cycles wasted polling UART RXNE flag
+- ❌ Task only yields when preempted by tick interrupt
+- ❌ Higher power consumption
+- ✅ Simple code (fewer lines)
+- ✅ Good for learning
 
-**Print Task Priority: 3 (Highest Application Priority)**
-- Ensures immediate processing when messages queued
-- Prevents character echo from appearing mid-menu
-- Provides responsive user experience
+---
 
-**Print Queue Depth: 10 messages**
-- Sufficient for burst scenarios
-- Rarely exceeds 2-3 messages in practice
-- Timeout prevents deadlock if queue fills
+### After (Stream Buffer Mode)
 
-### Lessons Learned
+```c
+void uart_task_init(void)
+{
+    uart_stream_buffer = xStreamBufferCreate(128, 1);
+    HAL_UART_Receive_IT(&huart2, &uart_rx_byte, 1);
+}
 
-1. **Exclusive Resource Ownership > Mutex Protection**
-   - Simpler code (no take/give boilerplate in 10+ locations)
-   - No deadlock or priority inversion possible
-   - Easier to debug and extend
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    xStreamBufferSendFromISR(uart_stream_buffer, &uart_rx_byte, 1, &woken);
+    HAL_UART_Receive_IT(&huart2, &uart_rx_byte, 1);
+    portYIELD_FROM_ISR(woken);
+}
 
-2. **Higher Priority for Output Tasks**
-   - Responsive UI requires immediate message processing
-   - Print task at priority 3 ensures prompt echo and menu display
-   - Application logic tasks (priority 2) can tolerate brief delays
+void uart_task_handler(void *parameters)
+{
+    while(1) {
+        // TRUE BLOCKING - task enters BLOCKED state, yields CPU
+        xStreamBufferReceive(uart_stream_buffer, &ch, 1, portMAX_DELAY);
 
-3. **Buffer Sizing is Critical**
-   - Measure actual usage (longest menu, worst-case message)
-   - Add 50-100% headroom for future expansion
-   - Silent truncation causes hard-to-debug UI issues
+        print_char(ch);
+        // ...
+    }
+}
+```
 
-4. **Queue-based Design Scales Better**
-   - Easy to add features (timestamps, log levels, priorities)
-   - Can redirect output without changing application code
-   - Natural fit for producer-consumer patterns
+**Characteristics:**
+- ✅ Task enters BLOCKED state (true blocking)
+- ✅ Zero CPU waste (no polling)
+- ✅ Instant wake-up (<10μs from ISR)
+- ✅ Lower power consumption
+- ✅ Production-quality design
+- ⚠️ More code (split ISR/Task)
+- ✅ Better for real products
 
-### Testing Verification
+---
 
-✅ **Character Echo:** Immediate, responsive, no lag
-✅ **Menu Display:** Complete, no truncation, proper formatting
-✅ **Command Processing:** Clean output, no text corruption
-✅ **Error Handling:** Buffer overflow and queue full handled gracefully
-✅ **LED Patterns:** All 4 patterns work correctly
-✅ **State Machine:** Navigation between menus reliable
+## Debugging Tips
+
+### 1. Verify Task States
+
+```c
+// In FreeRTOSConfig.h
+#define configGENERATE_RUN_TIME_STATS  1
+#define configUSE_TRACE_FACILITY       1
+
+// Check task state
+eTaskState uart_state = eTaskGetState(uart_task_handle);
+
+// Should be:
+// - eBlocked when idle (good!)
+// - eRunning only briefly when processing (good!)
+// - NOT eRunning constantly (bad - still polling!)
+```
+
+---
+
+### 2. Monitor Stream Buffer Usage
+
+```c
+size_t available = xStreamBufferBytesAvailable(uart_stream_buffer);
+size_t space = xStreamBufferSpacesAvailable(uart_stream_buffer);
+
+// Healthy system:
+// - available ≈ 0 (task keeping up with ISR)
+// - space ≈ 128 (buffer mostly empty)
+
+// Problem indicators:
+// - available growing (task can't keep up)
+// - space shrinking (buffer filling up → data loss imminent)
+```
+
+---
+
+### 3. Monitor Queue Depths
+
+```c
+UBaseType_t cmd_waiting = uxQueueMessagesWaiting(command_queue);
+UBaseType_t print_waiting = uxQueueMessagesWaiting(print_queue);
+
+// Should be 0 or low when system is idle
+// High values indicate backlog in processing
+```
+
+---
+
+### 4. Breakpoint Locations
+
+**To verify ISR is called:**
+```c
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    // ← Breakpoint here
+    // Should hit on every received byte
+
+    xStreamBufferSendFromISR(...);
+    // ...
+}
+```
+
+**To verify task wakes up:**
+```c
+size_t received = xStreamBufferReceive(...);
+// ← Breakpoint here
+// Should hit immediately after ISR completes
+```
+
+**To verify print task executes:**
+```c
+void print_task_handler(void *parameters)
+{
+    while(1) {
+        xQueueReceive(print_queue, &msg, portMAX_DELAY);
+        // ← Breakpoint here
+        // Should hit when any task calls print_message()
+    }
+}
+```
+
+---
+
+## Best Practices Implemented
+
+### 1. ISR Safety
+
+✅ Always use `FromISR` variants in interrupt context:
+```c
+xStreamBufferSendFromISR(...)  // NOT xStreamBufferSend()
+xQueueSendFromISR(...)         // NOT xQueueSend()
+xTaskNotifyFromISR(...)        // NOT xTaskNotify()
+portYIELD_FROM_ISR(...)        // NOT portYIELD()
+```
+
+✅ Check higher priority task woken:
+```c
+BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+xStreamBufferSendFromISR(..., &xHigherPriorityTaskWoken);
+portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+```
+
+---
+
+### 2. Resource Management
+
+✅ Create all FreeRTOS objects before starting scheduler:
+```c
+uart_stream_buffer = xStreamBufferCreate(...);
+configASSERT(uart_stream_buffer != NULL);  // Catch creation failure
+
+command_queue = xQueueCreate(...);
+configASSERT(command_queue != NULL);
+```
+
+✅ Start first reception before task runs:
+```c
+HAL_UART_Receive_IT(&huart2, &uart_rx_byte, 1);
+```
+
+---
+
+### 3. Separation of Concerns
+
+| Concern | Owner | Benefit |
+|---------|-------|---------|
+| **UART RX** | UART Task (via ISR + stream buffer) | Clean reception logic |
+| **UART TX** | Print Task (via queue) | No mutex needed |
+| **Command Processing** | Command Handler | Decoupled from I/O |
+| **LED Control** | Software Timers | Non-blocking patterns |
+
+**Result:** Maintainable, testable, scalable architecture
+
+---
+
+### 4. Error Handling
+
+✅ Buffer overflow protection:
+```c
+if (rx_index >= (UART_RX_BUFFER_SIZE - 1)) {
+    rx_index = 0;
+    print_message("ERROR: Buffer overflow\r\n");
+}
+```
+
+✅ Queue full handling:
+```c
+if (xQueueSend(queue, &item, timeout) != pdPASS) {
+    print_message("ERROR: Queue full\r\n");
+}
+```
+
+---
+
+## Future Enhancements
+
+### 1. DMA Mode (Even Lower CPU)
+
+```c
+// Start circular DMA reception
+HAL_UART_Receive_DMA(&huart2, dma_buffer, DMA_BUFFER_SIZE);
+
+// Half-complete callback
+void HAL_UART_RxHalfCpltCallback(UART_HandleTypeDef *huart)
+{
+    // Process first half while DMA fills second half
+    xStreamBufferSend(uart_stream_buffer, &dma_buffer[0], DMA_BUFFER_SIZE/2, 0);
+}
+
+// Complete callback
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    // Process second half while DMA fills first half
+    xStreamBufferSend(uart_stream_buffer, &dma_buffer[DMA_BUFFER_SIZE/2], DMA_BUFFER_SIZE/2, 0);
+}
+```
+
+**Benefits:**
+- Zero CPU for byte-by-byte reception
+- ISR only called on buffer half-full/full
+- Even better power efficiency
+
+---
+
+### 2. Command History
+
+```c
+static char cmd_history[CMD_HISTORY_SIZE][COMMAND_MAX_LENGTH];
+static uint8_t history_index = 0;
+
+// On up arrow (ESC [ A)
+void recall_previous_command(void)
+{
+    if (history_index > 0) {
+        history_index--;
+        strcpy(rx_buffer, cmd_history[history_index]);
+        print_message(rx_buffer);
+    }
+}
+```
+
+---
+
+### 3. TX Stream Buffer (Non-Blocking Transmit)
+
+```c
+StreamBufferHandle_t tx_stream_buffer;
+
+// Any task - fully non-blocking
+void print_message_nb(const char *msg)
+{
+    xStreamBufferSend(tx_stream_buffer, msg, strlen(msg), 0);
+}
+
+// DMA TX ISR feeds from stream buffer
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+    size_t bytes = xStreamBufferReceiveFromISR(tx_stream_buffer, tx_buffer, TX_BUFFER_SIZE, &woken);
+    if (bytes > 0) {
+        HAL_UART_Transmit_DMA(&huart2, tx_buffer, bytes);
+    }
+}
+```
+
+---
+
+### 4. Error Statistics
+
+```c
+typedef struct {
+    uint32_t uart_overrun_errors;
+    uint32_t uart_framing_errors;
+    uint32_t uart_parity_errors;
+    uint32_t stream_buffer_overflows;
+    uint32_t queue_full_errors;
+} system_stats_t;
+
+// Menu option to display stats
+void print_system_stats(void)
+{
+    print_message("=== System Statistics ===\r\n");
+    printf("UART Overrun: %lu\r\n", stats.uart_overrun_errors);
+    printf("Buffer Overflow: %lu\r\n", stats.stream_buffer_overflows);
+    // ...
+}
+```
 
 ---
 
 ## Summary
 
-This architecture demonstrates professional embedded systems design:
+### Key Takeaways
 
-✅ **Modular**: Clear separation of concerns (UART RX, UART TX, commands, LEDs)
-✅ **Thread-Safe**: Dedicated print task eliminates race conditions
-✅ **Non-Blocking**: Queue-based print system, tasks return immediately
-✅ **Efficient**: 98% CPU idle, low power consumption
-✅ **Scalable**: 83% heap free, room for expansion
-✅ **Responsive**: <6ms worst-case latency, ~50-100μs print enqueue
-✅ **Robust**: Queue-based decoupling, error handling, exclusive resource ownership
-✅ **Documented**: Comprehensive inline and architectural docs
+1. **Stream Buffer UART RX** - TRUE blocking, zero CPU waste, instant wake-up
+2. **Dedicated Print Task** - Cleaner than mutexes, guaranteed thread safety
+3. **Multi-Task Architecture** - Clean separation of RX, TX, command processing
+4. **Production-Ready** - Comprehensive error handling, robust design patterns
 
-**Total Lines of Code:** ~1000 (excluding HAL/FreeRTOS)
-**Complexity:** Moderate (suitable for learning/production)
-**Best Practices:** Dedicated I/O task, queue-based communication, task notifications, software timers
-**Key Innovation:** Print task with exclusive UART TX ownership (superior to mutex approach)
+### Architectural Strengths
 
----
+| Aspect | Implementation | Benefit |
+|--------|----------------|---------|
+| **UART RX** | Stream Buffer + ISR | TRUE blocking, zero CPU waste |
+| **UART TX** | Dedicated Print Task | No mutex, no priority inversion |
+| **Command Flow** | Queue-based | Decoupled RX from processing |
+| **LED Control** | Software Timers | Non-blocking, deterministic |
+| **Power** | WFI in idle hook | ~98% time in low-power mode |
+| **Thread Safety** | Queues + Stream Buffers | Lock-free, no race conditions |
 
-## Implementation Status
+### Performance Metrics
 
-### ✅ Completed Features
-
-| Feature | Status | Notes |
-|---------|--------|-------|
-| UART Task | ✅ Complete | Character RX, command buffering, backspace handling |
-| Print Task | ✅ Complete | Exclusive TX ownership, priority 3, 512-byte buffer |
-| Command Handler | ✅ Complete | Menu state machine, LED pattern control |
-| LED Effects | ✅ Complete | 4 patterns via software timers |
-| Thread Safety | ✅ Complete | Queue-based, no race conditions |
-| Error Handling | ✅ Complete | Buffer overflow, queue full detection |
-| Power Management | ✅ Complete | WFI in idle hook (~98% sleep time) |
-| Documentation | ✅ Complete | Comprehensive inline and architectural docs |
-
-### 🚀 Recommended Next Steps
-
-1. **SEGGER RTT Logging Task**
-   - Add dedicated logging via debug probe (no UART pins needed)
-   - Queue-based like print task, priority 1
-   - Log task states, queue depths, heap usage, performance metrics
-   - Enable SystemView for visual task analysis
-
-2. **Advanced Features**
-   - User-configurable LED patterns (store in flash)
-   - Command history (up/down arrow support)
-   - Runtime statistics menu (task CPU usage, stack high water marks)
-
-3. **Production Hardening**
-   - Watchdog timer integration
-   - Stack overflow detection hooks
-   - Assertion handlers for configASSERT()
-   - Fault handlers with diagnostic output
+- **RX Latency:** ~10-15 μs (byte arrival to task processing)
+- **TX Latency:** ~20-50 μs (print_message() call to enqueue)
+- **CPU Utilization:** < 0.1% during normal typing
+- **Power State:** >99% in WFI sleep mode
+- **Memory Usage:** ~8.7 KB (17% of heap), 62 KB free
 
 ---
 
-## Quick Reference
+## References
 
-**Build:** STM32CubeIDE, ARM GCC toolchain
-**Target:** STM32F407VG Discovery Board
-**Debug:** ST-LINK/V2 (SWD)
-**Terminal:** 115200 baud, 8N1, `/dev/tty.usbserial-A5069RR4`
-**RTOS:** FreeRTOS v10.x
-**Heap:** 75 KB, ~17% utilized, ~62 KB free
+- [FreeRTOS Stream Buffer Documentation](https://www.freertos.org/RTOS-stream-buffer-example.html)
+- [FreeRTOS Queue Documentation](https://www.freertos.org/a00018.html)
+- [FreeRTOS Task Notifications](https://www.freertos.org/RTOS-task-notifications.html)
+- [STM32 HAL UART Documentation](https://www.st.com/resource/en/user_manual/um1725-description-of-stm32f4-hal-and-lowlayer-drivers-stmicroelectronics.pdf)
+- FreeRTOS API Reference: stream_buffer.h, queue.h, task.h
+- STM32F4 Reference Manual: USART section (RM0090)
 
-**Key Files:**
-- `Core/Src/main.c` - Initialization and task creation
-- `Core/Src/uart_task.c` - Character reception and buffering
-- `Core/Src/print_task.c` - **Print task implementation (new)**
-- `Core/Src/command_handler.c` - Menu state machine
-- `Core/Src/led_effects.c` - LED pattern control
-- `Core/Inc/print_task.h` - **Print API interface (new)**
-- `Architecture.md` - This document
+---
 
-**Repository:** Local development workspace
-**License:** Educational/Personal Use
+**Document Version:** 2.0 (Stream Buffer Update)
 **Last Updated:** December 2024
+**Project:** 014LedPatternsUartInput
+**Architecture:** Multi-task FreeRTOS with Stream Buffer UART RX

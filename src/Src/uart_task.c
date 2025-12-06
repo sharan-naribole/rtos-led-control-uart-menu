@@ -4,28 +4,38 @@
  * @brief          : UART Communication Task Implementation
  ******************************************************************************
  * @description
- * This module implements a character-by-character UART reception task with
- * command buffering and processing. It uses FreeRTOS primitives for
- * inter-task communication and synchronization.
+ * This module implements an efficient interrupt-driven UART reception task
+ * using FreeRTOS Stream Buffers. It handles character-by-character input
+ * with echo and command buffering.
+ *
+ * Architecture:
+ * ┌─────────────┐     ┌──────────────┐     ┌──────────────┐
+ * │ UART RX ISR │ ──> │ Stream Buffer│ ──> │  UART Task   │
+ * │  (Instant)  │     │  (Lock-free) │     │  (BLOCKED)   │
+ * └─────────────┘     └──────────────┘     └──────────────┘
  *
  * Key Features:
- * - Non-blocking character reception with echo
+ * - TRUE task blocking (yields CPU when idle)
+ * - Interrupt-driven reception (zero CPU waste)
  * - Command buffering with overflow protection
  * - Backspace handling
  * - Queue-based command passing to handler task
  * - All UART TX operations delegated to print task
  *
  * Synchronization Strategy:
+ * - uart_stream_buffer: ISR deposits bytes, task reads (lock-free)
  * - command_queue: Decouples reception from command processing
  * - Task notification: Wakes up command handler when command ready
  * - print_message()/print_char(): Thread-safe UART TX via print task
  *
  * Thread Safety:
  * - UART TX: All output goes through print task (no direct HAL calls)
+ * - UART RX: Stream buffer handles ISR-to-Task synchronization
  * - Buffer access: Single task only (no protection needed)
  *
- * @note UART RX is handled by this task, UART TX is handled by print task.
- *       This separation eliminates the need for mutex protection.
+ * @note UART RX is handled by this task via ISR+stream buffer.
+ *       UART TX is handled by print task. This separation eliminates
+ *       the need for mutex protection.
  ******************************************************************************
  */
 
@@ -36,8 +46,12 @@
 #include <stdio.h>
 
 /* FreeRTOS Objects */
-QueueHandle_t command_queue = NULL;           // Command queue (UART -> Handler)
-extern UART_HandleTypeDef huart2;             // UART2 peripheral handle
+QueueHandle_t command_queue = NULL;                  // Command queue (UART -> Handler)
+static StreamBufferHandle_t uart_stream_buffer = NULL;  // Stream buffer (ISR -> Task)
+extern UART_HandleTypeDef huart2;                    // UART2 peripheral handle
+
+/* Single-byte buffer for interrupt reception */
+static uint8_t uart_rx_byte;
 
 /* Reception State */
 static char rx_buffer[UART_RX_BUFFER_SIZE];   // Command assembly buffer
@@ -50,18 +64,30 @@ static TaskHandle_t command_handler_task_handle = NULL;
  * @retval None
  *
  * Creates:
- * 1. Command Queue - Holds up to 5 commands (32 chars each)
+ * 1. Stream Buffer - ISR-to-Task communication (128 bytes)
+ *    Flow: UART RX ISR -> Stream buffer -> UART task
+ *    Purpose: Efficient, lock-free byte transfer from interrupt to task
+ *    Trigger: Task wakes on ANY byte (trigger level = 1)
+ *
+ * 2. Command Queue - Holds up to 5 commands (32 chars each)
  *    Flow: UART task -> Queue -> Command handler task
  *    Prevents: Blocking UART reception during command processing
  *
- * 2. Command Handler Task - Processes commands from queue
+ * 3. Command Handler Task - Processes commands from queue
  *    Priority: 2 (same as UART task for balanced scheduling)
  *    Stack: 256 words (sufficient for menu printing)
+ *
+ * 4. Start UART interrupt reception
  *
  * Note: Print task is initialized separately via print_task_init()
  */
 void uart_task_init(void)
 {
+    // Create stream buffer (128 bytes, trigger on 1 byte)
+    // Trigger level = 1 means task wakes immediately when ANY byte arrives
+    uart_stream_buffer = xStreamBufferCreate(UART_STREAM_BUFFER_SIZE, 1);
+    configASSERT(uart_stream_buffer != NULL);
+
     // Create command queue: 5 slots × 32 chars
     // Size chosen to buffer rapid commands without blocking
     command_queue = xQueueCreate(5, COMMAND_MAX_LENGTH * sizeof(char));
@@ -76,6 +102,10 @@ void uart_task_init(void)
                                     2,             // Priority
                                     &command_handler_task_handle);
     configASSERT(status == pdPASS);
+
+    // Start first interrupt-based UART reception
+    // HAL will call HAL_UART_RxCpltCallback when byte arrives
+    HAL_UART_Receive_IT(&huart2, &uart_rx_byte, 1);
 }
 
 static void print_welcome_message(void)
@@ -107,6 +137,46 @@ void print_main_menu(void)
 }
 
 /**
+ * @brief  UART RX Complete Callback (called from ISR context)
+ * @param  huart: UART handle
+ * @retval None
+ *
+ * ISR Operation:
+ * 1. Called automatically by HAL when byte received
+ * 2. Deposit byte into stream buffer (ISR-safe)
+ * 3. Stream buffer wakes up UART task if blocked
+ * 4. Re-enable reception for next byte
+ *
+ * Thread Safety:
+ * - Uses xStreamBufferSendFromISR (ISR-safe variant)
+ * - Handles context switch if higher priority task woken
+ *
+ * Efficiency:
+ * - Minimal ISR overhead (~2-3 μs)
+ * - Lock-free stream buffer write
+ * - Task woken immediately (no polling delay)
+ */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart == &huart2) {
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+
+        // Send byte to stream buffer (ISR-safe, lock-free)
+        // If UART task is blocked reading, it will be woken immediately
+        xStreamBufferSendFromISR(uart_stream_buffer,
+                                 &uart_rx_byte,
+                                 1,
+                                 &xHigherPriorityTaskWoken);
+
+        // Re-enable reception for next byte
+        HAL_UART_Receive_IT(&huart2, &uart_rx_byte, 1);
+
+        // Yield to higher priority task if woken
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    }
+}
+
+/**
  * @brief  UART Reception Task - Main task loop
  * @param  parameters: Task parameters (unused)
  * @retval None (task never returns)
@@ -119,7 +189,7 @@ void print_main_menu(void)
  * 3. Print welcome message and main menu
  *
  * Main Loop Operations:
- * - Receive one character (blocking, no timeout)
+ * - Receive one character from stream buffer (TRUE BLOCKING - yields CPU)
  * - Echo character back to terminal
  * - Handle special characters:
  *   * CR/LF: Process complete command
@@ -131,6 +201,11 @@ void print_main_menu(void)
  * 2. Command added to queue
  * 3. Command handler task notified
  * 4. Handler prints response and appropriate menu
+ *
+ * Efficiency:
+ * - Task enters BLOCKED state when no data (yields CPU to other tasks)
+ * - Woken immediately by ISR when byte arrives
+ * - Zero CPU waste (no polling loop)
  *
  * @note Character echo is NOT mutex-protected because it's a single-byte
  *       transmission within the same task - no risk of corruption
@@ -164,19 +239,27 @@ void uart_task_handler(void *parameters)
          * Main Reception Loop
          * ------------------
          * This loop processes characters one-by-one with immediate echo.
-         * The blocking receive ensures the task sleeps when no data available.
+         * Uses stream buffer for TRUE BLOCKING (task yields CPU when idle).
          *
          * Flow:
-         * 1. Block waiting for character (UART RX interrupt wakes us)
-         * 2. Echo character to terminal (user feedback)
-         * 3. Process character:
+         * 1. Read byte from stream buffer (TRUE BLOCKING - yields CPU)
+         * 2. ISR wakes us immediately when byte arrives
+         * 3. Echo character to terminal (user feedback)
+         * 4. Process character:
          *    - CR/LF: Complete command -> send to queue -> notify handler
          *    - Backspace: Remove last character from buffer
          *    - Normal: Add to buffer (with overflow check)
          */
 
-        // Receive one character (blocks until available)
-        if (HAL_UART_Receive(&huart2, &received_char, 1, portMAX_DELAY) == HAL_OK) {
+        // Read one byte from stream buffer
+        // TRUE BLOCKING: Task enters BLOCKED state, yields CPU to other tasks
+        // Wakes immediately when ISR deposits byte into stream buffer
+        size_t received = xStreamBufferReceive(uart_stream_buffer,
+                                               &received_char,
+                                               1,
+                                               portMAX_DELAY);
+
+        if (received > 0) {
             /*
              * Case 1: Command Complete (CR or LF)
              * User pressed Enter - process the complete command

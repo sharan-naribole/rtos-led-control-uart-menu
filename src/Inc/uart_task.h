@@ -8,14 +8,22 @@
  * FreeRTOS synchronization objects. The UART task handles character-by-character
  * input with echo and command buffering.
  *
+ * Architecture: Stream Buffer Mode (Efficient)
+ * - Interrupt-driven UART reception (HAL_UART_Receive_IT)
+ * - Stream buffer for ISR-to-Task communication
+ * - TRUE task blocking (yields CPU when idle)
+ * - Zero CPU waste (no polling)
+ *
  * Key Components:
- * - UART Reception Task: Receives user input character-by-character
+ * - UART Reception Task: Receives user input via stream buffer
  * - Command Queue: Passes complete commands to handler task
+ * - Stream Buffer: Efficient ISR-to-Task byte transfer
  *
  * Configuration:
  * - UART2 peripheral: 115200 baud, 8N1, no flow control
  * - Command buffer: 32 characters max (configurable)
  * - RX buffer: 128 characters (internal buffering)
+ * - Stream buffer: 128 bytes (ISR-to-Task FIFO)
  * - Command queue depth: 5 commands
  *
  * Thread Safety:
@@ -36,6 +44,7 @@ extern "C" {
 #include "task.h"
 #include "queue.h"
 #include "semphr.h"
+#include "stream_buffer.h"
 
 /*============================================================================
  * Configuration Constants
@@ -48,6 +57,14 @@ extern "C" {
  *         to allow for overflow detection.
  */
 #define UART_RX_BUFFER_SIZE 128
+
+/**
+ * @brief  Stream buffer size for ISR-to-Task communication
+ * @note   Used for efficient interrupt-driven UART reception. The ISR deposits
+ *         received bytes into this buffer, and the task reads from it.
+ *         Trigger level is set to 1 (task wakes on any byte).
+ */
+#define UART_STREAM_BUFFER_SIZE 128
 
 /**
  * @brief  Maximum length of a single command
